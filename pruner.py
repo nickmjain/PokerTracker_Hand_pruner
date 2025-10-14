@@ -271,7 +271,7 @@ def main():
 
         cursor.execute("SELECT COUNT(*) FROM active_players_temp")
         active_player_count = cursor.fetchone()[0]
-        print(f"[INFO] Created temp table with {active_player_count:,} unique active players.")
+        print(f"[INFO] Created temp table with {active_player_count:,} unique recently active players.")
 
         for hand_type in args.hand_types:
             summary_table = get_table_names(hand_type)['summary']
