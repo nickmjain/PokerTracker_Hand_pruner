@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-PT4 Database Pruner
-... [Docstring remains the same] ...
+PT4 Database Pruner - Fixed Version
+Safely prunes inactive hands while maintaining PT4 database integrity
 """
-
 import argparse
 import datetime
 import os
@@ -98,35 +97,134 @@ def create_connection(args):
         sys.exit(1)
 
 
+def update_cache_tracking(cursor, hand_type):
+    """Updates PT4's cache tracking to prevent full rebuilds."""
+    print(f"[{hand_type.upper()}] Updating cache tracking values...")
+    
+    if hand_type == 'cash':
+        # Get max cash hand ID
+        cursor.execute("SELECT COALESCE(MAX(id_hand), 0) FROM cash_hand_summary")
+        max_hand_id = cursor.fetchone()[0]
+        
+        # Update cache tracking
+        cursor.execute("""
+            UPDATE settings 
+            SET setting_value = %s 
+            WHERE setting_name IN ('cache_update:cash', 'cache_update:cash_custom')
+        """, (str(max_hand_id),))
+        
+        print(f"  Updated cash cache tracking to hand ID: {max_hand_id:,}")
+        
+    elif hand_type == 'tourney':
+        # Get max tourney hand ID
+        cursor.execute("SELECT COALESCE(MAX(id_hand), 0) FROM tourney_hand_summary")
+        max_hand_id = cursor.fetchone()[0]
+        
+        # Update cache tracking
+        cursor.execute("""
+            UPDATE settings 
+            SET setting_value = %s 
+            WHERE setting_name IN ('cache_update:tourney', 'cache_update:tourney_custom')
+        """, (str(max_hand_id),))
+        
+        print(f"  Updated tourney cache tracking to hand ID: {max_hand_id:,}")
+
+def clean_orphaned_cache_entries(cursor, hand_type, dry_run=False):
+    """Removes cache entries for players with no hands."""
+    cache_table = 'cash_cache' if hand_type == 'cash' else 'tourney_cache'
+    stats_table = 'cash_hand_player_statistics' if hand_type == 'cash' else 'tourney_hand_player_statistics'
+    
+    print(f"[{hand_type.upper()}] Checking for orphaned cache entries...")
+    
+    # Count orphaned entries
+    cursor.execute(f"""
+        SELECT COUNT(*) 
+        FROM {cache_table} cc
+        WHERE NOT EXISTS (
+            SELECT 1 FROM {stats_table} ps 
+            WHERE ps.id_player = cc.id_player
+            LIMIT 1
+        )
+    """)
+    orphaned_count = cursor.fetchone()[0]
+    
+    if orphaned_count > 0:
+        print(f"  Found {orphaned_count:,} orphaned cache entries")
+        
+        if not dry_run:
+            print(f"  Deleting orphaned {cache_table} entries...")
+            cursor.execute(f"""
+                DELETE FROM {cache_table}
+                WHERE id_player NOT IN (
+                    SELECT DISTINCT id_player FROM {stats_table}
+                )
+            """)
+            deleted = cursor.rowcount
+            print(f"  Deleted {deleted:,} orphaned cache entries")
+    else:
+        print(f"  No orphaned cache entries found")
+
+def remove_orphaned_players(cursor, dry_run=False):
+    """Removes players with no hands in any game type."""
+    print("\n--- Cleaning Orphaned Players ---")
+    
+    # Count orphaned players
+    cursor.execute("""
+        SELECT COUNT(*) 
+        FROM player p
+        WHERE NOT EXISTS (
+            SELECT 1 FROM cash_hand_player_statistics WHERE id_player = p.id_player
+        ) AND NOT EXISTS (
+            SELECT 1 FROM tourney_hand_player_statistics WHERE id_player = p.id_player
+        )
+    """)
+    orphaned_count = cursor.fetchone()[0]
+    
+    if orphaned_count > 0:
+        print(f"Found {orphaned_count:,} players with no hands")
+        
+        if not dry_run:
+            print("Deleting orphaned players...")
+            cursor.execute("""
+                DELETE FROM player 
+                WHERE id_player NOT IN (
+                    SELECT DISTINCT id_player FROM cash_hand_player_statistics
+                    UNION
+                    SELECT DISTINCT id_player FROM tourney_hand_player_statistics
+                )
+            """)
+            deleted = cursor.rowcount
+            print(f"Deleted {deleted:,} orphaned players")
+    else:
+        print("No orphaned players found")
+
 def execute_bulk_pruning(conn, cursor, hand_type, days, cutoff_date, dbname, dry_run=False, hand_limit=1000000):
     """
     Executes the pruning check sequentially using LIMIT and OFFSET to provide
     granular progress tracking per 100k hand window.
     """
     tables = get_table_names(hand_type)
-
     print(f"\n[{hand_type.upper()}] Running sequential batch prune operation...")
-
+    
     BATCH_SIZE = 100000
     total_input_batches = math.ceil(hand_limit / BATCH_SIZE)
-
     pruned_hand_ids = []
-
+    
     print(f"Starting granular analysis loop (Total windows to analyze: {total_input_batches:,})")
     print(f"--- Each window processes {BATCH_SIZE:,} hands from oldest to newest ---")
-
+    
     cumulative_pruned_count = 0
     total_analyzed = 0
-
+    
     for batch_number in range(total_input_batches):
         offset = batch_number * BATCH_SIZE
-
         current_limit = min(BATCH_SIZE, hand_limit - offset)
+        
         if current_limit <= 0:
             break
-
+            
         start_time_batch = time.time()
-
+        
         hands_to_prune_batch_query = sql.SQL("""
             WITH current_batch_candidates AS (
                 SELECT {summary}.id_hand
@@ -148,27 +246,25 @@ def execute_bulk_pruning(conn, cursor, hand_type, days, cutoff_date, dbname, dry
             summary=tables['summary'],
             player_stats=tables['player_stats']
         )
-
+        
         params = [cutoff_date, current_limit, offset]
-
+        
         try:
             cursor.execute(hands_to_prune_batch_query, params)
             batch_results = cursor.fetchall()
         except psycopg2.Error as e:
             print(f"\nCRITICAL QUERY ERROR IN BATCH {batch_number + 1}: {e}")
             break
-
+            
         current_batch_ids = [row[0] for row in batch_results]
         pruned_hand_ids.extend(current_batch_ids)
-
         batch_pruned_count = len(current_batch_ids)
         cumulative_pruned_count = len(pruned_hand_ids)
-
         total_analyzed = offset + current_limit
-
+        
         input_window_start = offset + 1
         input_window_end = total_analyzed
-
+        
         elapsed_batch = time.time() - start_time_batch
         print(
             f"Window {batch_number + 1:,} / {total_input_batches:,} "
@@ -177,139 +273,158 @@ def execute_bulk_pruning(conn, cursor, hand_type, days, cutoff_date, dbname, dry
             f"Cumulative Pruned: {cumulative_pruned_count:,} "
             f"(Time: {elapsed_batch:.2f}s)"
         )
-
+    
     hands_to_delete_count = len(pruned_hand_ids)
-
     print(f"\n[{hand_type.upper()}] Scan complete.")
     print(f"Total hands analyzed by the database: {total_analyzed:,}")
     print(f"Hands found eligible for deletion: {hands_to_delete_count:,}")
-
+    
     if total_analyzed > 0:
         pruning_ratio_percent = (hands_to_delete_count / total_analyzed) * 100
         print(f"Total pruning ratio: {pruning_ratio_percent:.1f}%")
     else:
         print("Total pruning ratio: N/A (No hands analyzed)")
-
+        
     print(f"\n[{hand_type.upper()}] Total eligible hands for deletion: {hands_to_delete_count:,} (Dry Run: {dry_run}).")
-
+    
     if hands_to_delete_count == 0:
         return 0, 0
-
+        
     if dry_run:
         return hands_to_delete_count, 0
-
+        
+    # Create temp table and perform deletion
     temp_table_name = sql.Identifier(f'temp_prune_ids_{hand_type}_{int(time.time())}')
-
     print(f"Loading {hands_to_delete_count:,} hand IDs into temporary table for deletion...")
-
+    
     cursor.execute(sql.SQL("CREATE TEMP TABLE {} (id_hand BIGINT PRIMARY KEY) ON COMMIT DROP").format(temp_table_name))
-
+    
     data_to_insert = [(id_hand,) for id_hand in pruned_hand_ids]
     insert_query = sql.SQL("INSERT INTO {} (id_hand) VALUES (%s)").format(temp_table_name)
     cursor.executemany(insert_query, data_to_insert)
-
+    
+    # Delete from player statistics
     delete_stats_query = sql.SQL("""
         DELETE FROM {player_stats}
         WHERE id_hand IN (SELECT id_hand FROM {temp_table})
     """).format(player_stats=tables['player_stats'], temp_table=temp_table_name)
-
+    
     print("Executing DELETE on Player Statistics table...")
     cursor.execute(delete_stats_query)
     stats_deleted = cursor.rowcount
-
+    
+    # Delete from hand summary
     delete_summary_query = sql.SQL("""
         DELETE FROM {summary}
         WHERE id_hand IN (SELECT id_hand FROM {temp_table})
     """).format(summary=tables['summary'], temp_table=temp_table_name)
-
+    
     print("Executing DELETE on Hand Summary table...")
     cursor.execute(delete_summary_query)
     summary_deleted = cursor.rowcount
-
+    
     if summary_deleted != hands_to_delete_count:
         print(f"WARNING: Summary rows deleted ({summary_deleted:,}) "
               f"does not match pre-scan count ({hands_to_delete_count:,}).")
-
+    
     return summary_deleted, stats_deleted
-
 
 def main():
     args = parse_arguments()
-
-    print("\n--- PT4 Database Pruner ---")
+    
+    print("\n--- PT4 Database Pruner (Fixed Version) ---")
     print(f"Inactivity Threshold (N): {args.days} days")
     print(f"Dry Run Mode: {args.dry_run} (Use --commit flag for real deletions)")
     print(f"Hand Types: {', '.join(args.hand_types).upper()}")
     print(f"Processing Limit: {args.limit:,} hands per type.\n")
-
+    
     conn = create_connection(args)
     cursor = conn.cursor()
-
+    
     total_pruned_summary = 0
     start_time = time.time()
-
+    
     try:
         cutoff_date = (datetime.datetime.now() - datetime.timedelta(days=args.days)).strftime('%Y-%m-%d')
         print(f"Cutoff Date: {cutoff_date} (Hands older than this are eligible for pruning)")
-
+        
         print("\n--- Initializing Global Active Player Scan ---")
         active_player_cte = sql.SQL("""
             CREATE TEMP TABLE active_players_temp (id_player BIGINT PRIMARY KEY) ON COMMIT DROP;
+            
             INSERT INTO active_players_temp (id_player)
             SELECT DISTINCT id_player
             FROM cash_hand_player_statistics chps_c
             JOIN cash_hand_summary chs_c ON chps_c.id_hand = chs_c.id_hand
             WHERE chs_c.date_played > (CURRENT_DATE - INTERVAL %s)
+            
             UNION
+            
             SELECT DISTINCT id_player
             FROM tourney_hand_player_statistics thps_t
             JOIN tourney_hand_summary ths_t ON thps_t.id_hand = ths_t.id_hand
             WHERE ths_t.date_played > (CURRENT_DATE - INTERVAL %s);
         """)
-
+        
         cursor.execute(active_player_cte, [f"{args.days} days", f"{args.days} days"])
-
         cursor.execute("SELECT COUNT(*) FROM active_players_temp")
         active_player_count = cursor.fetchone()[0]
         print(f"[INFO] Created temp table with {active_player_count:,} unique recently active players.")
-
+        
+        # Process each hand type
         for hand_type in args.hand_types:
             summary_table = get_table_names(hand_type)['summary']
-
+            
             cursor.execute(sql.SQL("SELECT COUNT(*) FROM {}").format(summary_table))
             total_hands = cursor.fetchone()[0]
             print(f"\n[{hand_type.upper()}] Total hands in database: {total_hands:,}")
-
+            
             cursor.execute(sql.SQL("SELECT COUNT(*) FROM {} WHERE date_played > %s").format(summary_table), (cutoff_date,))
             skipped_hands = cursor.fetchone()[0]
             print(f"[{hand_type.upper()}] Hands newer than cutoff date (retained): {skipped_hands:,}")
-
+            
+            # Execute the pruning
             summary_deleted, stats_deleted = execute_bulk_pruning(
                 conn, cursor, hand_type, args.days, cutoff_date, args.dbname, args.dry_run, args.limit
             )
-
+            
             total_pruned_summary += summary_deleted
-
+            
             print(f"[{hand_type.upper()}] Result:")
             print(f"  Deleted Hands (Summary): {summary_deleted:,}")
             print(f"  Deleted Rows (Statistics): {stats_deleted:,}")
-
+            
+            # CRITICAL FIX 1: Clean orphaned cache entries
+            if summary_deleted > 0:
+                clean_orphaned_cache_entries(cursor, hand_type, args.dry_run)
+                
+                # CRITICAL FIX 2: Update cache tracking
+                if not args.dry_run:
+                    update_cache_tracking(cursor, hand_type)
+        
+        # CRITICAL FIX 3: Remove orphaned players
+        remove_orphaned_players(cursor, args.dry_run)
+        
         if not args.dry_run and total_pruned_summary > 0:
             print("\nCommit initiated. Persisting changes to database...")
             conn.commit()
             print(f"**Successfully deleted {total_pruned_summary:,} hands in total.**")
-
-            print("\n--- ACTION REQUIRED ---")
-            print("To fully reclaim the disk space and improve query performance, execute these commands manually:")
+            
+            print("\n--- POST-DELETION MAINTENANCE ---")
+            print("The following PT4 maintenance tasks are recommended:")
+            print("1. In PT4: Database → Database Management → Rebuild Cache")
+            print("2. After cache rebuild: Database → Database Management → Rebuild Index")
+            print("\nOptional manual SQL commands for immediate space reclamation:")
             print(f"VACUUM FULL;")
             print(f"REINDEX DATABASE {args.dbname};")
+            
         elif total_pruned_summary > 0:
             print(f"\nDry run successful. {total_pruned_summary:,} hands were eligible for deletion. Changes were NOT committed.")
             conn.rollback()
         else:
             print("\nNo hands were found eligible for deletion. Database remains unchanged.")
             conn.rollback()
-
+            
     except psycopg2.Error as e:
         print(f"\nCRITICAL DB ERROR: Rolling back transaction.")
         print(e)
@@ -321,9 +436,22 @@ def main():
         elapsed_time = time.time() - start_time
         print(f"\n--- Pruner Complete ---")
         print(f"Total time elapsed: {elapsed_time:.2f} seconds.")
+        
+        # Show final database state
+        if not args.dry_run and total_pruned_summary > 0:
+            print("\n--- Final Database State ---")
+            cursor.execute("SELECT COUNT(*) FROM player")
+            total_players = cursor.fetchone()[0]
+            print(f"Total players remaining: {total_players:,}")
+            
+            cursor.execute("SELECT setting_name, setting_value FROM settings WHERE setting_name LIKE '%cache_update%' ORDER BY setting_name")
+            cache_settings = cursor.fetchall()
+            print("Cache tracking values:")
+            for name, value in cache_settings:
+                print(f"  {name}: {value}")
+        
         cursor.close()
         conn.close()
-
 
 if __name__ == "__main__":
     main()
